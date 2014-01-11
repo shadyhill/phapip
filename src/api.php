@@ -16,13 +16,17 @@ class API{
 	protected $_pk2;				//primary key of second obj
 	protected $_db_engine;
 	protected $_url_len;			//number of items in url before first obj
+	protected $_tables;
+	protected $_endpoints;
 	
 	public function __construct(){
 	    //$this->_model = array();
 	    $this->_response_data = array();
 	    $this->_filters = array();
 	    $this->_payload = array();		
-	    
+	    $this->_tables = array();
+	    $this->_endpoints = array();
+
 	    $this->initAPI();
 	    $this->initObj();
 	    $this->initRequest();	    
@@ -33,7 +37,7 @@ class API{
 	    $std_classes = get_declared_classes();
 	    
 	    //required for settings
-	    require "config.php";
+	    require "config.api.php";
 
 	    //set the db enginer
 	    //TODO: check that one exists?
@@ -45,18 +49,26 @@ class API{
 	    //take the diff to find the user classes
 	    $user_classes = array_diff($all_classes, $std_classes);
 	    
-	    //map endpoint to classes
-	    $endpoints = array();
-
+	    //map endpoint to classes	    
 	    //see if we have an endpoint swap
-	    foreach($user_classes as $cl){
-	        if(property_exists($cl,"endpoint")){
-	        	$rc = new ReflectionClass($cl);	        		        	
-	        	$ep = $rc->getProperty('endpoint')->getValue(new $cl);	        	
-	        	$endpoints[$cl] = $ep;
-	        	//at some point we should record this in a hash
-	        	//TODO: figure out how to only allow the endpoint to work and not the class name
-	        }
+	    foreach($user_classes as $cl){	    	
+			if(!property_exists($cl, "table")){
+				return "You must specifiy a table";
+			}else{
+				$rc = new ReflectionClass($cl);	
+				$table = $rc->getProperty('table')->getValue(new $cl);
+			}
+			
+			//the endpoint is either defined or defaults to the classname
+			if(property_exists($cl, 'endpoint')){
+				$ep = $rc->getProperty('endpoint')->getValue(new $cl);
+			}else{
+				$ep = strtolower($cl);
+			}
+
+			$this->_tables[$table]["model"] = $cl;
+			$this->_endpoints[$ep]["model"] = $cl;
+						
 	    }
 	    
 	    $gURL = rtrim($_GET['url'],"/"); 
@@ -80,18 +92,22 @@ class API{
 	    //TODO: if endpoint exists, then don't allow class to be made on just class name
 	    //for example /person/ shouldn't work if /people/ is set as endpoint
 	    //check for endpoint
-	    $ep = array_search($tObj, $endpoints);
-	    if($ep !== FALSE) $tObj = $ep;
+	    if(isset($this->_endpoints[$tObj])) $model = $this->_endpoints[$tObj]["model"];
+	    //$endpoint = array_search($tObj, $endpoints);
+	    //if($endpoint !== FALSE) $tObj = $endpoint;
 	    	    
 	    //look for pre-mapped endpoints first
 	    
 	    //then look for the right class
-	    if(!class_exists($tObj)){
+	    if(!class_exists($model)){
 	    	$this->renderResponse(404,"Not found","json",array("message" => "No existing class definition for $tObj"));
 	    }
 	    
-	    $ref = new ReflectionClass($tObj);		
+	    $ref = new ReflectionClass($model);
 	    $this->_obj = $ref->newInstance();
+
+	    //this probably isn't good practice, but set defaults for missing params
+	    $this->makeValidClass($this->_obj);	    
 	    
 	    //look for the pk in the first position
 	    //TODO: this should probably work with the url parser to look in the correct place
@@ -114,6 +130,11 @@ class API{
 	    }	    
 	}
 
+	//this probably isn't good practice, but set defaults for missing params
+	private function makeValidClass(&$obj){
+		if(empty($obj->depth)) $obj->depth = 1;
+		if(empty($obj->reqruied)) $obj->required = array();
+	}
 	
 	public function handle_request(){
 	    switch($_SERVER['REQUEST_METHOD']){
@@ -140,7 +161,7 @@ class API{
 		//if the primary key is set, add it to the qData
 		//hanlde an override case, otherwise set to "id"
 		if(isset($this->_pk1)){
-			if($this->_obj->pk) $qData = array($this->_obj->pk => $this->_pk1);
+			if(!empty($this->_obj->pk)) $qData = array($this->_obj->pk => $this->_pk1);
 			else $qData = array("id" => $this->_pk1);
 		}else $qData = array();
 
@@ -149,12 +170,12 @@ class API{
 		$qData = array_merge($qData,$this->_filters);
 
 		
-	    $this->_response_data = $this->_db->get_request2($this->_obj->table, $qData,$this->_obj);		
+	    $this->_response_data = $this->_db->get_request($this->_obj, $qData);		
 	}
 	
 	public function post_request(){
-		//TODO: firgue out how to return location of post
-	    $this->_db->post_request($this->_table,$this->_payload);
+		//TODO: firgue out how to return location of post		
+	    $this->_db->post_request($this->_obj,$this->_payload);
 	}
 	
 	//TODO: PUT SHOULD GET THE EXISTING OBJ AND ONLY UPDATE NEW FIELDS
@@ -183,30 +204,42 @@ class API{
 	    $this->buildFields($dbData["fields"],$this->_obj);	    
 
 	    //parse data for related objects and inspect as well
-	    foreach($dbData["related"] as $r){
+	    foreach($dbData["related"] as $r){	    	
 	    	//TODO: check the table is a reference for an endpoint
 	    	$rTable = $r['table'];
-	    	$this->_obj->_related[$rTable] = $this->buildRelated($r);	    	
+	    	if(isset($this->_tables[$rTable])){	    		
+	    		$this->_obj->_related[$rTable] = $this->buildRelated($r);
+	    	}
+	    	//TODO: NEED TO BUILD RELATED RELATIONSHIP MAPPINGS
+	    	//CHECK THAT THESE WILL WORK IN THE BUILD RELATED FUNCTIONS	    	
 	    }	    
-
 	}
 
-	private function buildRelated($related){
+	private function buildRelated($related){		
 		$rels = array();
-		if(class_exists($related['table'])){
-	    	$ref = new ReflectionClass($related['table']);		
+		$rTable = $related['table'];			
+		if(class_exists($this->_tables[$rTable]['model'])){
+	    	$ref = new ReflectionClass($this->_tables[$rTable]['model']);		
 	    	$rObj = $ref->newInstance();
+	    	$this->makeValidClass($rObj);
 	    	$this->buildFields($related["fields"],$rObj);
 
 	    	//need to recursively check for related objs
 	    	if(count($related["related"]) > 0){
 	    		foreach($related["related"] as $rel){	    			
-	    			$rTable = $rel['table'];
-	    			$rels[$rTable] = $this->buildRelated($rel);
+	    			$rTable = $rel['table'];	    			
+	    			if(isset($this->_tables[$rTable])){	    			
+	    				$rels[$rTable] = $this->buildRelated($rel);
+	    			}
 	    		}
 	    	}
-	    }
-	    return array("obj" => $rObj,"_related" => $rels);
+	    	$rObj->_related = $rels;
+
+	    	return array("obj" => $rObj,
+	    			 "column" => $related["column"],
+	    			 "host_column" => $related["host_column"]);
+	    			 //"_related" => $rels);
+	    }  
 	}
 
 	//TODO: handle "type" and "key" to be smarter about set up
@@ -261,7 +294,7 @@ class API{
 	    
 	    //get any get variables and treat as filters
 	    foreach($_GET as $key => $value){
-	    	if($key != "url") $this->_filters[$key] = $value;
+	    	if($key != "url" && $key != "_") $this->_filters[$key] = $value;
 	    }
 	}
 

@@ -1,5 +1,9 @@
 <?php
 
+//the goal is to cache everything, especially the describe and information_schema
+//and then queries should utilize as much joining as possible
+//by possibly saving query until as much possible is known
+
 class DB{
 
 	protected $_pdo;
@@ -21,10 +25,13 @@ class DB{
     	}
 	}
 
-	//recursive function 
+	//recursive function for getting field info and related tables
+	//TODO: verify we can't get in an infinte loop
+	//TODO: need to but the query in a try/catch
 	public function inspectDB($table,$depth){
 		
-		if(empty($depth) && $depth !== 0) $depth = 1;
+		//check the session
+		//if(!isset($_SESSION[$table]))
 		
 		$fields = array();
 		$related = array();
@@ -32,12 +39,11 @@ class DB{
 			
 		$stmt = $this->_pdo->prepare($sql);		
 		$stmt->execute();
-		while($qobj = $stmt->fetch()){			
-    		
+		while($qobj = $stmt->fetch()){			    		
     		$fields[$qobj->Field] = array("type" => $qobj->Type,
     										"allow_null" => $qobj->Null,
     										"key" => $qobj->Key);
-		}
+		}		
 		
 		//recursively build related data
 		if($depth > 0){
@@ -50,7 +56,9 @@ class DB{
 			}			
 		}
 
-		return array("fields" => $fields, "related" => $related);	
+		$sTable[$table] = array("fields" => $fields, "related" => $related);
+
+		return array("fields" => $fields, "related" => $related);
 	}
 
 	public function findRelations($table){
@@ -71,11 +79,15 @@ class DB{
 	//table is the db table
 	//qData is query data including field and value
 	//obj is the class instance from api.php
-	public function get_request2($table,$qData,$obj){
+	public function get_request($obj,$qData){
+		
 		$response = array();
 
+		//in the event that an empty obj gets passed in
+		if(empty($obj)) return $response;
+
 		//build the sql query
-		$sql = "SELECT * FROM $table";
+		$sql = "SELECT * FROM $obj->table";
 		$first = true;
 		foreach($qData as $key => $val){
 			if($first){
@@ -92,49 +104,34 @@ class DB{
 		while($qobj = $stmt->fetch()){
 			$row = array();
 			foreach($qobj as $key => $val){
-				if($val == NULL && !$obj->display_null) continue;
+				if($val == NULL && (empty($obj->display_null) || !$obj->display_null)) continue;
 				$row[$key] = $val;
 			}
-			//add relational data recursively
-			//TODO: Limit number of recursive calls
-			//TODO: Return recursive info in short/long form (ids/fields)
-			if($table != "address"){
-				$row['address'] = $this->get_request2('address',array('person_id' => 1),$obj);
+
+			//rather than building nested array, maybe should build join?
+			//hard to do when returning one-to-many and many-to-many
+			if(is_array($obj->_related)){
+				foreach($obj->_related as $key => $rel){
+					$rObj = $rel["obj"];
+					$column = $rel["column"];
+					$host_column = $rel["host_column"];
+					if(isset($row[$host_column])){
+						$rData = array($column => $row[$host_column]);
+						$row[$key] = $this->get_request($rObj,$rData);				
+					}
+				}
 			}
 
 			$response[] = $row;
 		}
 		return $response;
-	}
+	}	
 
-	public function get_request($table,$pk = 0){
-		$response = array();
-		
-		$sql = "SELECT * FROM $table";
-	    if($pk != 0){
-	    	$sql .= " WHERE id = :pk";
-	    	$stmt = $this->_pdo->prepare($sql);
-	    	$stmt->execute(array("pk" => $pk));
-	    }else{	    		
-	    	$stmt = $this->_pdo->prepare($sql);
-	    	$stmt->execute();
-	    }
-	    while($qobj = $stmt->fetch()){
-	    	$row = array();
-	    	foreach($qobj as $key => $val){
-	    		if($val == NULL && !$this->_obj->display_null) continue;	    		
-	    		$row[$key] = $val;
-	    	}
-	    	$response[] = $row;
-	    }
-	    return $response;
-	}
-
-	public function post_request($table,$payload){
+	public function post_request($obj,$payload){
 		$sqlA = $sqlB = "";	
 		$params = array();	//stores parameters in order (same as $this->_row, but may need it)
 	    
-		$sql = "INSERT INTO $table (";			
+		$sql = "INSERT INTO $obj->table (";			
 			
 		foreach ($payload as $key => $value) {
 			$sqlA .= " $key,";
@@ -145,14 +142,14 @@ class DB{
 
 		$sql .= "$sqlA) VALUES ($sqlB)";
 
-		$stmt = $this->_pdo->prepare($sql);
+		$stmt = $this->_pdo->prepare($sql);		
 
 		if($stmt === false){
 			return (object)array("status"=>false,"type" => "pdo_error", "error"=>$this->_pdo->errorInfo());
 		}
 
 		try{
-			$res = $stmt->execute($this->_row);
+			$res = $stmt->execute($payload);
 		}catch(PDOException $e){
     		return (object)array("status"=>false,"type" => "pdo_exception", "error"=>$e);    		
     	}
